@@ -129,6 +129,10 @@ class OllamaProvider(BaseLLMProvider):
             "keep_alive": cfg.ollama_keep_alive,
             "options": options,
         }
+        # Qwen3 models "think" (long hidden reasoning) by default — slow on a
+        # laptop GPU and eats the num_predict budget. Off unless OLLAMA_THINK=1.
+        if "qwen3" in chosen.lower() and os.getenv("OLLAMA_THINK", "0") not in ("1", "true"):
+            payload["think"] = False
 
         async with self._client.stream(
             "POST",
@@ -169,6 +173,19 @@ class OllamaProvider(BaseLLMProvider):
                         break
                 except json.JSONDecodeError:
                     continue
+
+    async def prewarm(self, system_prompt: str = "", model: str | None = None):
+        """Load the model into GPU memory before the first question (an empty
+        /api/generate call just loads it). Saves the 30-45 s first-load wait."""
+        chosen = model or self._pick_model(True)
+        try:
+            await self._client.post(
+                f"{self._base}/api/generate",
+                json={"model": chosen, "keep_alive": cfg.ollama_keep_alive},
+                timeout=120,
+            )
+        except Exception:
+            pass
 
     async def health_check(self) -> bool:
         try:

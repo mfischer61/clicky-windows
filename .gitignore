@@ -31,3 +31,10 @@ github_token.json
 Thumbs.db
 Desktop.ini
 .DS_Store
+_backup_pre_minibar/
+
+# Personal course notes (kept local)
+course_notes/*.md
+!course_notes/README.md
+# Retired (Google blocked Gemini CLI personal login)
+ai/gemini_cli_provider.py

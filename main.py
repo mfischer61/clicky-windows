@@ -47,7 +47,12 @@ from ui.panel import CompanionPanel, AppState
 from ui.overlay import (
     CursorOverlay, MODE_IDLE, MODE_LISTENING, MODE_THINKING, MODE_SPEAKING
 )
-from hotkey import GlobalHotkeyMonitor, StopHotkey
+from hotkey import GlobalHotkeyMonitor, StopHotkey, ToggleHotkey
+from ui.minibar import MiniBar
+
+
+def _env_on(name: str, default: str = "1") -> bool:
+    return os.getenv(name, default).strip().lower() not in ("0", "false", "off", "no", "")
 from companion_manager import CompanionManager
 
 
@@ -161,8 +166,11 @@ def main():
     # ── Core components ───────────────────────────────────────────────────────
     manager = CompanionManager()
     panel   = CompanionPanel()
-    overlay = CursorOverlay()
+    # Blue triangle that follows the mouse. Off unless CLICKY_BUDDY_CURSOR=1.
+    overlay = CursorOverlay() if _env_on("CLICKY_BUDDY_CURSOR", "0") else None
     tray    = TrayManager()
+    bar     = MiniBar()
+    voice   = _env_on("CLICKY_VOICE", "1")
 
     # ── Wire signals ──────────────────────────────────────────────────────────
 
@@ -170,30 +178,51 @@ def main():
     def _on_state(state: AppState):
         panel.set_state(state)
         tray.set_state_icon(state.name.lower())
-        overlay.set_mode(STATE_TO_CURSOR_MODE.get(state, MODE_IDLE))
+        bar.set_state_name(state.name)
+        if overlay is not None:
+            overlay.set_mode(STATE_TO_CURSOR_MODE.get(state, MODE_IDLE))
 
     manager.sig_state_changed.connect(_on_state)
 
     # Response streaming
     manager.sig_response_chunk.connect(panel.append_response_chunk)
+    manager.sig_response_chunk.connect(bar.append_chunk)
 
     # Audio level → cursor waveform (+ panel meter)
     manager.sig_audio_level.connect(panel.set_audio_level)
-    manager.sig_audio_level.connect(overlay.set_audio_level)
 
-    # Pointing directives
-    manager.sig_point_at.connect(overlay.point_at)
-    manager.sig_point_hold.connect(overlay.set_point_hold)
-    manager.sig_point_release.connect(overlay.release_point)
+    if overlay is not None:
+        manager.sig_audio_level.connect(overlay.set_audio_level)
+        # Pointing directives
+        manager.sig_point_at.connect(overlay.point_at)
+        manager.sig_point_hold.connect(overlay.set_point_hold)
+        manager.sig_point_release.connect(overlay.release_point)
+        # Whiteboard annotations (legacy per-shape signals)
+        manager.sig_arrow.connect(overlay.add_arrow)
+        manager.sig_circle.connect(overlay.add_circle)
+        manager.sig_underline.connect(overlay.add_underline)
+        manager.sig_label.connect(overlay.add_text)
+        # Teaching drawings — generic shape channel with progressive animation
+        manager.sig_draw.connect(overlay.add_shape)
+        manager.sig_clear_drawings.connect(overlay.clear_annotations)
 
-    # Whiteboard annotations (legacy per-shape signals)
-    manager.sig_arrow.connect(overlay.add_arrow)
-    manager.sig_circle.connect(overlay.add_circle)
-    manager.sig_underline.connect(overlay.add_underline)
-    manager.sig_label.connect(overlay.add_text)
-    # Teaching drawings — generic shape channel with progressive animation
-    manager.sig_draw.connect(overlay.add_shape)
-    manager.sig_clear_drawings.connect(overlay.clear_annotations)
+    # ── Mini chat bar ─────────────────────────────────────────────────────
+    bar.on_check.connect(manager.ask_check)
+    bar.on_new_chat.connect(manager.new_check_chat)
+    bar.on_course_selected.connect(manager.set_course)
+    bar.on_stop.connect(manager.stop)
+    bar.on_shown.connect(manager.prewarm)
+
+    def _bar_model(provider: str, model: str):
+        if provider != cfg.llm_provider():
+            manager.set_active_provider(provider)
+            panel.refresh_for_provider(provider)
+            tray.rebuild_menu()
+        manager.set_model(model)
+    bar.on_model_selected.connect(_bar_model)
+    _sel = bar.current_selection()
+    if _sel:
+        _bar_model(*_sel)
 
     # Errors. The toast names the log file because it only has room for the
     # message itself — issue #15 was reported with no traceback simply because
@@ -221,12 +250,13 @@ def main():
     panel.on_document_dropped.connect(_on_doc_dropped)
 
     # Tray → UI / Manager
-    tray.on_show_panel.connect(panel.show)
-    tray.on_hide_panel.connect(panel.hide)
+    tray.on_show_panel.connect(bar.show_bar)
+    tray.on_hide_panel.connect(bar.hide_bar)
     tray.on_toggle_search.connect(manager.set_web_search)
     tray.on_toggle_wake_word.connect(manager.set_wake_word)
     tray.on_toggle_slow_mode.connect(manager.set_slow_mode)
-    tray.on_toggle_slow_mode.connect(overlay.set_slow_mode)
+    if overlay is not None:
+        tray.on_toggle_slow_mode.connect(overlay.set_slow_mode)
     tray.on_toggle_quiz_mode.connect(manager.set_quiz_mode)
     tray.on_toggle_privacy.connect(manager.set_privacy_guard)
     tray.on_toggle_code_mode.connect(manager.set_code_mode_auto)
@@ -435,30 +465,44 @@ def main():
     tray.on_quit.connect(lambda: (tray.hide_icon(), manager.shutdown(), app.quit()))
 
     # ── Global hotkey ─────────────────────────────────────────────────────────
-    hotkey = GlobalHotkeyMonitor(
-        on_press=manager.on_hotkey_press,
-        on_release=manager.on_hotkey_release,
-    )
-    hotkey.start()
+    # Push-to-talk only when voice is on
+    if voice:
+        hotkey = GlobalHotkeyMonitor(
+            on_press=manager.on_hotkey_press,
+            on_release=manager.on_hotkey_release,
+        )
+        hotkey.start()
+
+    # Ctrl+Alt+Space: show / hide the mini chat bar (emit = thread-safe hop
+    # from the keyboard hook thread onto the Qt main thread)
+    toggle_key = os.getenv("CLICKY_TOGGLE_HOTKEY", "ctrl+alt+space").strip() or "ctrl+alt+space"
+    toggle = ToggleHotkey(on_toggle=bar.sig_toggle.emit, key=toggle_key)
+    try:
+        toggle.start()
+    except Exception as e:
+        tray.show_notification("Clicky hotkey failed", f"{toggle_key}: {e}")
 
     # Esc = cancel current generation (kills Ollama ramble mid-stream)
     stop_key = StopHotkey(on_stop=manager.stop, key="esc")
     stop_key.start()
 
     # ── Show UI + start listener ──────────────────────────────────────────────
-    overlay.show()        # persistent overlay (cursor follow)
-    # Panel is hidden by default — user can open it from the tray menu if needed
-    manager.start()        # begin ambient mic + wake-word scanning
+    if overlay is not None:
+        overlay.show()    # persistent overlay (cursor follow)
+    # Panel + bar hidden by default — Ctrl+Alt+Space opens the bar
+    manager.start()        # begin ambient mic + wake-word scanning (if voice on)
 
     providers = cfg.describe()
-    _hk = "+".join(p.strip().capitalize() for p in cfg.hotkey.split("+"))
-    tray.show_notification(
-        "Clicky is running",
-        (f"Say 'Clicky' or press {_hk}  |  LLM: {providers['llm']}"
-         if cfg.ambient_mic() else
-         f"Press {_hk}, ask your question, and Clicky answers when you stop "
-         f"talking  |  LLM: {providers['llm']}"),
-    )
+    _tk = "+".join(p.strip().capitalize() for p in toggle_key.split("+"))
+    if voice:
+        _hk = "+".join(p.strip().capitalize() for p in cfg.hotkey.split("+"))
+        tray.show_notification(
+            "Clicky is running",
+            f"{_tk} opens chat, {_hk} to talk  |  LLM: {providers['llm']}",
+        )
+    else:
+        tray.show_notification(
+            "Clicky is running", f"{_tk} opens chat  |  LLM: {providers['llm']}")
 
     # ── First-run setup wizard ────────────────────────────────────────────────
     # Show the Ollama install / model pull walkthrough on the first launch.

@@ -199,6 +199,8 @@ class Config:
         override = os.environ.get("CLICKY_ACTIVE_LLM", "").strip().lower()
         if override in self.available_llm_providers():
             return override
+        if self._claude_cli_ok():
+            return "claude_cli"
         if self.anthropic_api_key:
             return "claude"
         if self.openai_api_key:
@@ -216,6 +218,14 @@ class Config:
     def available_llm_providers(self) -> list[str]:
         """All providers the user can switch to right now."""
         out = []
+        if self._claude_cli_ok():
+            out.append("claude_cli")   # Claude on your Pro/Max plan via Claude Code CLI
+        try:
+            from ai.agy_provider import is_available as _agy_ok
+            if _agy_ok():
+                out.append("agy")          # Gemini on your Google AI Pro login (Antigravity CLI)
+        except Exception:
+            pass
         if self.anthropic_api_key:
             out.append("claude")
         if self.openai_api_key:
@@ -231,6 +241,14 @@ class Config:
         out.append("ollama")     # always available if the daemon is running
         out.append("lmstudio")   # always available if the local server is running
         return out
+
+    @staticmethod
+    def _claude_cli_ok() -> bool:
+        try:
+            from ai.claude_cli_provider import is_available
+            return is_available()
+        except Exception:
+            return False
 
     def set_active_llm(self, name: str) -> None:
         """Runtime switch — next query uses this provider. Persisted to .env."""

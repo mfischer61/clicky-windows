@@ -173,3 +173,57 @@ class StopHotkey:
 
     def start(self):
         keyboard.add_hotkey(self._key, self._on_stop, suppress=False)
+
+
+class ToggleHotkey:
+    """Press-once global hotkey (default Ctrl+Alt+Space) that shows/hides the
+    mini chat bar. suppress=True keeps the keystroke from reaching the app
+    underneath (so no stray space is typed into your test page)."""
+
+    def __init__(self, on_toggle: Callable[[], None], key: str = "ctrl+alt+space"):
+        self._on_toggle = on_toggle
+        self._key = key
+        self._handle = None
+        self._rel_handle = None
+        self._armed = True              # re-armed when the last key lifts
+        self._fired_at = 0.0
+
+    def _fire(self):
+        # Holding the combo makes Windows auto-repeat it; fire once per press.
+        now = time.monotonic()
+        if not self._armed and now - self._fired_at < 1.0:
+            return                      # still the same held press
+        self._armed = False
+        self._fired_at = now
+        try:
+            self._on_toggle()
+        except Exception:
+            pass
+
+    def _rearm(self, _event=None):
+        self._armed = True
+
+    def start(self):
+        self._handle = keyboard.add_hotkey(
+            self._key, self._fire, suppress=True, trigger_on_release=False,
+        )
+        last = self._key.split("+")[-1].strip()
+        try:
+            self._rel_handle = keyboard.on_release_key(last, self._rearm)
+        except Exception:
+            self._armed = True
+            self._rel_handle = None
+
+    def stop(self):
+        if self._rel_handle is not None:
+            try:
+                keyboard.unhook(self._rel_handle)
+            except Exception:
+                pass
+            self._rel_handle = None
+        if self._handle is not None:
+            try:
+                keyboard.remove_hotkey(self._handle)
+            except Exception:
+                pass
+            self._handle = None

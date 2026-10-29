@@ -247,6 +247,32 @@ POINT_TRIGGER_RE = re.compile(
 )
 
 
+CHECK_SYSTEM_PROMPT = (
+    "You check answers on the user's PRACTICE test, shown in the attached "
+    "screenshot. Find the question the user is working on (the one that is "
+    "selected, highlighted, or named in their message). Read every answer "
+    "choice carefully and keep each letter paired with its exact text. Solve "
+    "the problem yourself first, then compare with the user's answer if one "
+    "is marked or typed.\n"
+    "Reply in this format, nothing more:\n"
+    "Answer: <letter, if any> <the choice text copied exactly from the screen>\n"
+    "Yours: <Correct | Incorrect | not marked>\n"
+    "Why: <1-2 short lines, key step or formula>\n"
+    "If the screenshot is unreadable or the question is ambiguous, say so in "
+    "one line. Plain text, no markdown headers. Accuracy matters more than speed."
+)
+
+
+class _NullListener:
+    """Stand-in when voice is off — every mic call is a no-op."""
+    def start(self): pass
+    def stop(self): pass
+    def start_recording(self): pass
+    def stop_recording(self): return b""
+    def set_wake_word_enabled(self, *_): pass
+    def set_ambient(self, *_): pass
+
+
 class CompanionManager(QObject):
     """Thread-safe signals for Qt UI updates from async/audio threads."""
 
@@ -348,8 +374,15 @@ class CompanionManager(QObject):
         except Exception:
             pass
 
+        # Voice can be switched off entirely (CLICKY_VOICE=0): no mic stream,
+        # no STT, no wake word. Typed questions still use the full pipeline.
+        self._voice = os.getenv("CLICKY_VOICE", "1").strip().lower() not in (
+            "0", "false", "off", "no")
+        self._check_history: List[Message] = []
+        self._course = os.getenv("CLICKY_COURSE", "").strip()
+
         # Always-on ambient listener
-        self._listener = AmbientListener(
+        self._listener = _NullListener() if not self._voice else AmbientListener(
             on_level=self._handle_level,
             on_wake=self._handle_wake,
             device=cfg.mic_device_index,
@@ -359,6 +392,88 @@ class CompanionManager(QObject):
         # Background asyncio loop
         self._thread = threading.Thread(target=self._run_loop, daemon=True)
         self._thread.start()
+
+    # ── Answer-check mode (mini chat bar) ─────────────────────────────────────
+
+    # ── Course notes (course_notes/<COURSE>.md added to the check prompt) ──
+
+    @staticmethod
+    def course_notes_dir():
+        return cfg.env_path().parent / "course_notes"
+
+    def set_course(self, name: str):
+        """Bar's course picker. '' = no course. Persisted to .env."""
+        self._course = (name or "").strip()
+        cfg._write_env("CLICKY_COURSE", self._course)
+        os.environ["CLICKY_COURSE"] = self._course
+
+    def _check_system(self) -> str:
+        """Check prompt + the selected course's notes. Notes are skipped for
+        local models (their small context can't hold them) unless
+        CLICKY_NOTES_LOCAL=1."""
+        system = CHECK_SYSTEM_PROMPT
+        if not self._course:
+            return system
+        local = cfg.llm_provider() in ("ollama", "lmstudio")
+        if local and os.getenv("CLICKY_NOTES_LOCAL", "0").strip() not in ("1", "true", "yes"):
+            return system
+        path = self.course_notes_dir() / f"{self._course}.md"
+        try:
+            notes = path.read_text(encoding="utf-8")   # re-read: edits apply live
+        except Exception:
+            return system
+        return (system + "\n\nCOURSE NOTES for " + self._course +
+                " (the user's class material — follow its conventions and "
+                "terminology; it may contain the user's known mistakes to watch "
+                "for):\n" + notes)
+
+    def prewarm(self):
+        """Spin up the LLM early (Claude CLI process / Ollama model) when the bar opens."""
+        llm = self._get_llm()
+        if hasattr(llm, "prewarm"):
+            self._submit(llm.prewarm(self._check_system(), self._current_model))
+
+    def new_check_chat(self):
+        """Forget the running conversation (bar's New button)."""
+        self._check_history = []
+        self._retire_llm()
+
+    def ask_check(self, text: str, images_b64: list):
+        """Typed question + screenshot(s) from the mini bar. Lean path: no
+        tutor features, pointing, TTS, web search or journal."""
+        text = (text or "").strip() or "Check my answer to the question on screen."
+        if not self._claim_begin():
+            return
+        self._submit(self._run_check(text, list(images_b64 or [])))
+
+    async def _run_check(self, text: str, images_b64: list):
+        self._emit_state(AppState.THINKING)
+        self._cancel_flag = False
+        full = ""
+        try:
+            async for chunk in self._get_llm().stream_response(
+                user_text=text,
+                screenshots_b64=images_b64,
+                history=self._check_history[-6:],
+                system_prompt=self._check_system(),
+                model=self._current_model,
+            ):
+                if self._cancel_flag:
+                    break
+                full += chunk
+                self.sig_response_chunk.emit(chunk)
+            self.sig_response_done.emit(full)
+            self._check_history += [
+                Message(role="user", content=text),
+                Message(role="assistant", content=full),
+            ]
+            self._check_history = self._check_history[-12:]
+        except Exception as e:
+            _log.exception("check failed: %s", e)
+            self.sig_error.emit(str(e))
+            self.sig_response_chunk.emit(f"\n[error] {e}")
+        finally:
+            self._emit_state(AppState.IDLE)
 
     # ── Lifecycle ─────────────────────────────────────────────────────────────
 
@@ -513,7 +628,13 @@ class CompanionManager(QObject):
     def _get_llm(self) -> BaseLLMProvider:
         if self._llm is None:
             provider = cfg.llm_provider()
-            if provider == "claude":
+            if provider == "claude_cli":
+                from ai.claude_cli_provider import ClaudeCLIProvider
+                self._llm = ClaudeCLIProvider()
+            elif provider == "agy":
+                from ai.agy_provider import AgyProvider
+                self._llm = AgyProvider()
+            elif provider == "claude":
                 from ai.claude_provider import ClaudeProvider
                 self._llm = ClaudeProvider()
             elif provider == "openai":
